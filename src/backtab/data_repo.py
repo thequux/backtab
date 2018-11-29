@@ -3,6 +3,7 @@ import contextlib
 import datetime
 import decimal
 import os.path
+import re
 import subprocess
 import threading
 import typing
@@ -14,10 +15,27 @@ import beancount.parser.printer
 import beancount.query.query
 import collections
 import io
+import json
 
 repo_lock = threading.RLock()
 
 CASH_ACCT = "Assets:Cash:Bar"
+
+
+# Diagnostics
+class Diagnostic:
+    message: str
+
+    def __init__(self, message):
+        self.message = message
+
+
+class Warning(Diagnostic):
+    pass
+
+
+class Error(Diagnostic):
+    pass
 
 
 @contextlib.contextmanager
@@ -32,7 +50,11 @@ def parse_price(price_str: typing.Union[float, str, decimal.Decimal, int]) -> de
 
 
 class UpdateFailed(Exception):
-    pass
+    diagnostics: typing.Dict[typing.List[Diagnostic]]
+
+    def __init__(self, message, diagnostics: typing.Dict[typing.List[Diagnostic]]):
+        super(UpdateFailed, self).__init__(message)
+        self.diagnostics = diagnostics
 
 
 class Member:
@@ -68,6 +90,7 @@ class Member:
             for currency in self.item_currencies
         )
 
+
 Payback = collections.namedtuple("Payback", {
     "account": str,
     "amount": decimal.Decimal,
@@ -87,20 +110,62 @@ class Product:
 
     payback: typing.Optional[Payback]
 
+    diagnostic: typing.Tuple[str, typing.List[Diagnostic]]
+
+    # noinspection PyBroadException
     def __init__(self, definition):
-        self.name = definition["name"]
+        report = []
+        error = False
+        self.name = definition.get("name")
+        if self.name is None:
+            report.append(Error("name missing"))
+            error = True
         self.localized_name = definition.get("localized_name", {})
-        self.currency = definition["currency"]
-        self.price = parse_price(definition["price"])
+        self.currency = definition.get("currency")
+        if self.currency is None:
+            report.append(Error("currency missing"))
+            error = True
+        if not re.match(r"^[A-Z]+$", self.currency):
+            report.append(Warning("Currency should be a single all-caps word"))
+        try:
+            self.price = parse_price(definition["price"])
+        except KeyError:
+            report.append(Error("Missing price"))
+            error = True
+        except Exception:
+            report.append(Error("Invalid price; must be a decimal"))
+            error = True
+
         self.category = definition.get("category", "misc")
+        if self.category not in ["food", "alcohol", "drink", "misc", "swag"]:
+            report.append(Warning("Unknown category \"%s\"" % (self.category,)))
         self.sort_key = definition.get("sort_key", "%s_%s" % (self.category, self.name))
         if "payback" in definition:
+            amount = definition["payback"].get("amount")
+            if amount is None:
+                report.append(Error("Payback does not list an amount"))
+                error = True
+                amount = "0"
+            try:
+                amount = parse_price(amount)
+            except Exception:
+                report.append("Invalid payback amount")
+            destination = definition["payback"].get("account")
+            if destination is None:
+                report.append(Error("No destination account given for payback"))
             self.payback = Payback(
-                account=definition["payback"]["account"],
-                amount=parse_price(definition["payback"]["amount"]),
+                account=destination,
+                amount=amount,
             )
         else:
             self.payback = None
+
+        diagnostic_name = (self.name
+                           if self.name is not None else
+                           ("Unknown product " + json.dumps(definition)))
+        self.diagnostic = (diagnostic_name, report)
+        if error:
+            raise ValueError("Invalid product")
 
     def to_json(self) -> typing.Dict:
         """Return the JSON form for clients. This does not include payback
@@ -236,6 +301,7 @@ class DepositTxn(Transaction):
             self.txn, CASH_ACCT,  amount, "EUR")
 
 
+# Data repo
 class RepoData:
     accounts: typing.Dict[str, Member]
     accounts_raw: typing.Dict[str, Member]
@@ -248,6 +314,8 @@ class RepoData:
     #    the underlying file may have changed; opened when needed
     instance_ledger_name: typing.Optional[str]
     instance_ledger_uncommitted: bool
+    bc_options_map: dict
+    diagnostics: typing.Dict[str, typing.List[Diagnostic]]
 
     synchronized: bool
     repo_path: str
@@ -270,7 +338,7 @@ class RepoData:
                            stderr=subprocess.PIPE,
                            check=True)
         except subprocess.CalledProcessError as e:
-            raise UpdateFailed(e.stderr)
+            raise UpdateFailed(e.stderr, {})
 
         try:
             self.load_data()
@@ -280,7 +348,7 @@ class RepoData:
             if isinstance(e, UpdateFailed):
                 raise
             else:
-                raise UpdateFailed("Failed to reload data") from e
+                raise UpdateFailed("Failed to reload data", {}) from e
         self.synchronized = True
 
     def git_cmd(self, *args):
@@ -313,8 +381,7 @@ class RepoData:
             self.git_cmd("git", "push")
         self.synchronized = True
 
-    @property
-    def instance_ledger(self) -> typing.TextIO:
+    def get_instance_ledger(self) -> typing.TextIO:
         while self.instance_ledger_name is None:
             import datetime
             import socket
@@ -372,8 +439,9 @@ class RepoData:
         while True:
             try:
                 with self.git_transaction():
-                    beancount.parser.printer.print_entry(bc_txn, file=self.instance_ledger)
-                    self.instance_ledger.flush()
+                    with self.get_instance_ledger as ledger:
+                        beancount.parser.printer.print_entry(bc_txn, file=ledger)
+                        ledger.flush()
                     self.add_file(self.instance_ledger_name)
             except subprocess.SubprocessError:
                 self.pull_changes()
@@ -389,20 +457,29 @@ class RepoData:
                 changed_members[member.internal_name] = member
         return list(changed_members.values())
 
-    @transaction()
-    def load_data(self):
+    def load_products(self, diagnostics: typing.Dict[str, typing.List[Diagnostic]]):
         import yaml
-
+        if diagnostics is None:
+            diagnostics = {}
         products = {}
+
         with open(os.path.join(self.repo_path, "static", "products.yml"), "rt") as f:
             raw_products = yaml.load(f)
         if type(raw_products) != list:
+            diagnostics["products.yml"] = [Error("Products should be a list")]
             raise TypeError("Products should be a list")
         for raw_product in raw_products:
             product = Product(raw_product)
             if product.currency in products:
                 raise UpdateFailed("Duplicate product %s" % (product.name,))
             products[product.currency] = product
+        return products
+
+    @transaction()
+    def load_data(self):
+
+        diagnostics = {}
+        products = {}
 
         product_currencies = {product.currency for product in products.values()}
 
@@ -445,11 +522,6 @@ class RepoData:
         self.accounts = accounts
         self.products = products
         self.bc_options_map = options
-
-    def close_instance_ledger(self):
-        if self.instance_ledger is not None:
-            self.instance_ledger.close()
-            self.instance_ledger = None
 
 
 REPO_DATA = RepoData()
